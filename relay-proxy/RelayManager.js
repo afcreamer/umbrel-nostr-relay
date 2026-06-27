@@ -65,20 +65,38 @@ class RelayManager {
 
     relay.on("connect", () => console.log(`Connected to ${relay.url}`));
 
+    // Register the 'error' listener exactly once per relay. nostr-tools v1 has no
+    // removeListener/off, so attaching a new relay.on('error', ...) inside connectRelay
+    // on every p-retry attempt (with forever: true below) accumulated listener closures
+    // without bound — a steady memory leak for any relay that fails to connect.
+    //
+    // Instead we keep a single listener and route errors to the in-flight attempt via a
+    // per-attempt token. Every state transition is guarded by token identity, so a stale
+    // continuation from an already-settled attempt can never reject or clear a newer one.
+    let currentAttempt = null;
+    relay.on("error", error => {
+      const attempt = currentAttempt;
+      if (!attempt) return;
+      currentAttempt = null;
+      attempt.reject(error || new Error(`Error event from ${relay.url} without an error object.`));
+    });
+
     // connectRelay returns a promise that resolves when the relay connects or rejects when the relay fails to connect
     // so that we can use p-retry to retry connection attempts with exponential backoff.
     const connectRelay = () => {
       // error objects do not seem to ever be passed to relay.connect or the on error event handler
       return new Promise((resolve, reject) => {
+        const attempt = { reject };
+        currentAttempt = attempt;
         relay.connect()
-        .then(resolve)
+        .then(() => {
+            if (currentAttempt === attempt) currentAttempt = null;
+            resolve();
+          })
         .catch(error => {
+            if (currentAttempt === attempt) currentAttempt = null;
             reject(error || new Error(`Connection to ${relay.url} failed without an error object.`));
           });
-
-        relay.on('error', error => {
-          reject(error || new Error(`Error event from ${relay.url} without an error object.`));
-        });
       });
     };
 
